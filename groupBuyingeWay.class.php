@@ -189,8 +189,8 @@ class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
 
 			$eway->setCustomerInvoiceDescription( 'Purchase: ' . $purchase->get_id() );
 
-			$eway->setCardHoldersName( 'John Smith' );
-			$eway->setCardNumber( '4444333322221111' );
+			$eway->setCardHoldersName( $checkout->cache['billing']['first_name'] . ' ' . $checkout->cache['billing']['last_name'] );
+			$eway->setCardNumber( $this->cc_cache['cc_number'] );
 			$eway->setCardExpiryMonth( $this->cc_cache['cc_expiration_month'] );
 			$eway->setCardExpiryYear( substr( $this->cc_cache['cc_expiration_year'], -2 ) );
 			$eway->setCVN( $this->cc_cache['cc_cvv'] );
