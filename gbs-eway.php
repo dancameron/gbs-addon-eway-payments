@@ -1,7 +1,7 @@
 <?php
 /*
-Plugin Name: Group Buying Payment Processor - eWay Direct Payments
-Version: Beta 1
+Plugin Name: Group Buying Payment Processor - eWay Direct Payments (beta)
+Version: .01
 Plugin URI: http://sproutventure.com/wordpress/group-buying
 Description: eWay Direct Payments Add-on.
 Author: Sprout Venture
