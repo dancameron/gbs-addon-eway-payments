@@ -1,19 +1,27 @@
 <?php
 
-class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
+class Group_Buying_eWay_Tokenized extends Group_Buying_Credit_Card_Processors {
 
-	const API_ENDPOINT_SANDBOX = 'https://www.eway.com.au/gateway_cvn/xmltest/testpage.asp';
-	const API_ENDPOINT_LIVE = 'https://www.eway.com.au/gateway_cvn/xmlpayment.asp';
+	const API_ENDPOINT_SANDBOX = 'https://www.eway.com.au/gateway/ManagedPaymentService/test/managedCreditCardPayment.asmx';
+	const API_ENDPOINT_LIVE = 'https://www.eway.com.au/gateway/ManagedPaymentService/managedCreditCardPayment.asmx';
 
 	const MODE_TEST = 'sandbox';
 	const MODE_LIVE = 'live';
-	const api_id_OPTION = 'gb_eway_username';
+
+
+	const API_ID_OPTION = 'gb_eway_customer_id';
+	const API_USERNAME_OPTION = 'gb_eway_username';
 	const API_PASSWORD_OPTION = 'gb_eway_password';
 	const API_MODE_OPTION = 'gb_eway_mode';
-	const PAYMENT_METHOD = 'Credit (eWay Direct Payments)';
+
+	const USER_META_PROFILE_ID = 'gb_eway_token_profile_id';
+	const USE_PROFILES = FALSE; // Set to TRUE if you want to store profiles
+
+	const PAYMENT_METHOD = 'Credit (eWay Token Payments)';
 	protected static $instance;
 	private $api_mode = self::MODE_TEST;
 	private $api_id = '';
+	private $api_username = '';
 	private $api_password = '';
 
 	public static function get_instance() {
@@ -38,17 +46,29 @@ class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
 	protected function __construct() {
 
 		parent::__construct();
-		$this->api_id = get_option( self::api_id_OPTION, '' );
-		// $this->api_password = get_option(self::API_PASSWORD_OPTION, '');
+		$this->api_id = get_option( self::API_ID_OPTION, '' );
+		$this->api_username = get_option(self::API_USERNAME_OPTION, '');
+		$this->api_password = get_option(self::API_PASSWORD_OPTION, '');
 		$this->api_mode = get_option( self::API_MODE_OPTION, self::MODE_TEST );
 
 		add_action( 'admin_init', array( $this, 'register_settings' ), 10, 0 );
 		add_action( 'purchase_completed', array( $this, 'complete_purchase' ), 10, 1 );
+		if ( GBS_DEV ) {
+			add_action( 'init', array( $this, 'capture_pending_payments' ) );
+		} else {
+			add_action( self::CRON_HOOK, array( $this, 'capture_pending_payments' ) );
+		}
 
-		// Limitations
-		add_filter( 'group_buying_template_meta_boxes/deal-expiration.php', array( $this, 'display_exp_meta_box' ), 10 );
-		add_filter( 'group_buying_template_meta_boxes/deal-price.php', array( $this, 'display_price_meta_box' ), 10 );
-		add_filter( 'group_buying_template_meta_boxes/deal-limits.php', array( $this, 'display_limits_meta_box' ), 10 );
+		if ( self::USE_PROFILES ) {
+			// Modify checkout 
+			add_filter( 'wp_head', array( $this, 'credit_card_template_js' ) );
+			add_filter( 'gb_payment_fields', array( $this, 'filter_payment_fields' ), 100, 3 );
+			add_filter( 'gb_payment_review_fields', array( $this, 'payment_review_fields' ), 100, 3 );
+
+			remove_action( 'gb_checkout_action_'.Group_Buying_Checkouts::PAYMENT_PAGE, array( $this, 'process_payment_page' ) );
+			add_action( 'gb_checkout_action_'.Group_Buying_Checkouts::PAYMENT_PAGE, array( $this, 'process_payment_page' ), 20, 1 );
+		}
+
 	}
 
 	public static function register() {
@@ -73,23 +93,10 @@ class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
 			}
 		}
 
-		$eway = $this->setup_eway( $checkout, $purchase );
-
-		if ( self::DEBUG ) error_log( '----------Response----------' . print_r( $eway, TRUE ) );
-
-		if ( $eway->doPayment() != EWAY_TRANSACTION_OK ) {
-			$this->set_error_messages( "Error occurred (".$eway->getError()."): " . $eway->getErrorMessage() );
+		// Create customer account
+		$profile_id = $this->create_profile( $checkout, $purchase );
+		if ( !$profile_id )
 			return FALSE;
-		}
-
-		$response = array();
-		$response['transaction-successful'] = $eway->getTrxnStatus();
-		$response['transaction-number'] = $eway->getTrxnNumber();
-		$response['transaction-reference'] = $eway->getTrxnReference();
-		$response['return-amount'] = $eway->getReturnAmount();
-		$response['auth-code'] = $eway->getAuthCode();
-		$response['shipping'] = $eway->getTrxnOption1();
-		$response['tax'] = $eway->getTrxnOption2();
 
 		/*
 		 * Purchase since payment was successful above.
@@ -118,6 +125,8 @@ class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
 				'purchase' => $purchase->get_id(),
 				'amount' => $purchase->get_total( $this->get_payment_method() ), // TODO CHANGE to NVP_DATA Match
 				'data' => array(
+					'profile_id' => $profile_id,
+					'reference_id' => $purchase->get_id(),
 					'api_response' => $response,
 					'masked_cc_number' => $this->mask_card_number( $this->cc_cache['cc_number'] ), // save for possible credits later
 				),
@@ -132,26 +141,262 @@ class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
 		return $payment;
 	}
 
+	///////////////
+	// capturing //
+	///////////////
+
 	/**
-	 * Complete the purchase after the process_payment action, otherwise vouchers will not be activated.
+	 * Attempt to capture the payment after purchase is complete
 	 *
 	 * @param Group_Buying_Purchase $purchase
 	 * @return void
 	 */
 	public function complete_purchase( Group_Buying_Purchase $purchase ) {
-		$items_captured = array(); // Creating simple array of items that are captured
-		foreach ( $purchase->get_products() as $item ) {
-			$items_captured[] = $item['deal_id'];
-		}
 		$payments = Group_Buying_Payment::get_payments_for_purchase( $purchase->get_id() );
 		foreach ( $payments as $payment_id ) {
 			$payment = Group_Buying_Payment::get_instance( $payment_id );
-			do_action( 'payment_captured', $payment, $items_captured );
-			do_action( 'payment_complete', $payment );
-			$payment->set_status( Group_Buying_Payment::STATUS_COMPLETE );
+			$this->capture_payment( $payment );
 		}
 	}
 
+	/**
+	 * Try to capture all pending payments
+	 *
+	 * @return void
+	 */
+	public function capture_pending_payments() {
+		$payments = Group_Buying_Payment::get_pending_payments();
+		foreach ( $payments as $payment_id ) {
+			$payment = Group_Buying_Payment::get_instance( $payment_id );
+			$this->capture_payment( $payment );
+		}
+	}
+
+
+	public  function capture_payment( Group_Buying_Payment $payment ) {
+
+		// is this the right payment processor? does the payment still need processing?
+		if ( $payment->get_payment_method() == $this->get_payment_method() && $payment->get_status() != Group_Buying_Payment::STATUS_COMPLETE ) {
+			$data = $payment->get_data();
+
+			// Do we have a transaction ID to use for the capture?
+			if ( isset( $data['profile_id'] ) ) {
+				$total = 0;
+				$items_to_capture = $this->items_to_capture( $payment );
+
+				if ( $items_to_capture ) {
+					$status = ( count( $items_to_capture ) < count( $data['uncaptured_deals'] ) ) ? 'NotComplete' : 'Complete';
+
+					// Total to capture
+					foreach ( $items_to_capture as $price ) {
+						$total += $price;
+					}
+
+					$transaction_id = $this->create_payment( $data['profile_id'], $total, $data['reference_id'] );
+
+					if ( $transaction_id ) { // Check to make sure the response was valid
+						// Reset uncaptured deals
+						foreach ( $items_to_capture as $deal_id => $amount ) {
+							unset( $data['uncaptured_deals'][$deal_id] );
+						}
+						// Set data
+						if ( !isset( $data['capture_response'] ) ) {
+							$data['capture_response'] = array();
+						}
+						$data['capture_response'][] = $response;
+						$payment->set_data( $data );
+
+						// Complete or not?
+						do_action( 'payment_captured', $payment, array_keys( $items_to_capture ) );
+						if ( $status == 'Complete' ) {
+							$payment->set_status( Group_Buying_Payment::STATUS_COMPLETE );
+							do_action( 'payment_complete', $payment );
+						} else {
+							$payment->set_status( Group_Buying_Payment::STATUS_PARTIAL );
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/////////////
+	// Utility //
+	/////////////
+
+	public function create_client() {
+		$client = new SoapClient( "https://www.eway.com.au/gateway/ManagedPaymentService/test/managedCreditCardPayment.asmx?WSDL" );
+
+		$header = '<eWAYHeader xmlns=\"'.$this->get_api_url().'\">
+		<eWAYCustomerID>'.$this->api_id.'</eWAYCustomerID>
+		<Username>'.$this->api_username.'</Username>
+		<Password>'.$this->api_password.'</Password>
+		</eWAYHeader>';
+
+		$vars = new SoapVar( $header, XSD_ANYXML );
+
+		$header = new SoapHeader( $this->get_api_url(), "eWAYHeader", $vars );
+
+		$client->__setSoapHeaders( array( $header ) );
+
+		return $client;
+	}
+
+	/**
+	 * 
+	 *
+	 * @param Group_Buying_Checkouts $checkout
+	 * @param Group_Buying_Purchase $purchase
+	 * @return array
+	 */
+	private function create_profile( Group_Buying_Checkouts $checkout, Group_Buying_Purchase $purchase ) {
+		$account_id = $purchase->get_account_id();
+		$user_id = $purchase->get_user();
+		$user = get_userdata( $user_id );
+		$profile_id = 0;
+
+		$client = $this->create_client();
+		
+		// Create customer object
+		
+		$event->customerRef = $account_id;
+		$event->Title = "";
+		$event->FirstName = $checkout->cache['billing']['first_name'];
+		$event->LastName = $checkout->cache['billing']['last_name'];
+		$event->Email = $user->user_email;
+		$event->State = $checkout->cache['billing']['zone'];
+		$event->Address =  $checkout->cache['billing']['street'];
+		$event->PostCode = $checkout->cache['billing']['postal_code'];
+		$event->Country = $checkout->cache['billing']['country'];
+
+		// If a token payment don't try to update the CC
+		if ( isset( $this->cc_cache['cc_number'] ) ) {
+			$event->CCNumber = $this->cc_cache['cc_number'];
+			$event->CCNameOnCard = $this->cc_cache['cc_number'];
+			$event->CCExpiryMonth = $this->cc_cache['cc_expiration_month'];
+			$event->CCExpiryYear = substr( $this->cc_cache['cc_expiration_year'], -2 );
+			$event->CVN = $this->cc_cache['cc_cvv'];
+		}
+
+		// If the customer already has a profile just update it.
+		if ( $this->has_profile_id( $user_id ) ) {
+			// The customer profile id
+			$profile_id = $this->get_customer_profile_id( $user_id );
+
+			// Update profile
+			$customer->managedCustomerID = $profile_id;
+			$result = $client->UpdateCustomer( $customer );
+			error_log( "update customer: " . print_r( $result, true ) );
+
+			// Validate the response
+			if ( !$result ) // If the update fails than a new profile should be created
+				$profile_id = 0;
+		}
+
+		// Create customer
+		if ( !$profile_id ) {
+			error_log( "client: " . print_r( $client, true ) );
+			$result = $client->CreateCustomer()->$event;
+			error_log( "create customer: " . print_r( $result, true ) );
+
+			// The customer profile id
+			$profile_id = $result->CreateCustomerResult; // TODO
+
+			// Save Profile ID
+			update_user_meta( $user_id, self::USER_META_PROFILE_ID, $profile_id );
+		}
+
+		return $profile_id;
+
+	}
+
+	public function create_payment( $profile_id, $total, $reference_id ) {
+		$client = $this->create_client();
+		
+		// Create payment object
+		$payment = new stdClass;
+		$payment->managedCustomerID = $profile_id;
+		$payment->amount = $total;
+		$payment->invoiceReference = $reference_id;
+
+		$result = $client->ProcessPayment( $payment );
+		error_log( "process payment: " . print_r( $result, true ) );
+
+		// Return Transaction ID
+		return $transaction_id;
+	}
+
+	//////////////
+	// Customer //
+	//////////////
+
+	public static function get_customer_profile_id( $user_id = 0 ) {
+
+		if ( !self::USE_PROFILES ) // Trick in order to keep profiles to be used
+			return FALSE;
+
+		if ( !$user_id ) {
+			$user_id = get_current_user_id();
+		}
+		$profile_id = get_user_meta( $user_id, self::USER_META_PROFILE_ID, TRUE );
+
+		if ( !$profile_id )
+			return FALSE;
+
+		return $profile_id;
+	}
+
+	public static function has_profile_id( $user_id = 0 ) {
+		if ( !$user_id ) {
+			$user_id = get_current_user_id();
+		}
+		return self::get_customer_profile_id( $user_id );
+	}
+
+	public static function get_customer_profile( $profile_id = 0 ) {
+
+		$profile_id = self::get_customer_profile_id();
+		if ( !$profile_id ) {
+			return FALSE;
+		}
+		
+		$client = $this->create_client();
+		$customer->managedCustomerID = $profile_id;
+
+		$result = $client->QueryCustomer( $customer );
+		if ( is_null( $result ) ) {
+			return FALSE;
+		}
+		
+		return $customer_profile;
+	}
+
+	public function query_payments() {
+		$client = $this->create_client();
+		$customer->managedCustomerID = $profile_id;
+
+		$result = $client->QueryPayment( $customer );
+
+		error_log( "query payments: " . print_r( $result, true ) );
+	}
+
+	///////////
+	// Misc. //
+	///////////
+
+	private function convert_money_to_cents( $value ) {
+		// strip out commas
+		$value = preg_replace( "/\,/i", "", $value );
+		// strip out all but numbers, dash, and dot
+		$value = preg_replace( "/([^0-9\.\-])/i", "", $value );
+		// make sure we are dealing with a proper number now, no +.4393 or 3...304 or 76.5895,94
+		if ( !is_numeric( $value ) ) {
+			return 0.00;
+		}
+		// convert to a float explicitly
+		$value = (float)$value;
+		return round( $value, 2 )*100;
+	}
 
 	/**
 	 * Grabs error messages from a Authorize response and displays them to the user
@@ -168,100 +413,148 @@ class Group_Buying_eWay extends Group_Buying_Credit_Card_Processors {
 		}
 	}
 
-	/**
-	 * Build the NVP data array for submitting the current checkout to Authorize as an Authorization request
-	 *
-	 * @param Group_Buying_Checkouts $checkout
-	 * @param Group_Buying_Purchase $purchase
-	 * @return array
-	 */
-	private function setup_eway( Group_Buying_Checkouts $checkout, Group_Buying_Purchase $purchase ) {
-			$user = get_userdata( $purchase->get_user() );
+	/////////////
+	// Checkout //
+	/////////////
 
-			require_once 'lib/EwayPayment.php';
-			$eway = new EwayPayment( $this->api_id, $this->get_api_url() );
-
-			$eway->setCustomerFirstname( $checkout->cache['billing']['first_name'] );
-			$eway->setCustomerLastname( $checkout->cache['billing']['last_name'] );
-			$eway->setCustomerEmail( $user->user_email );
-			$eway->setCustomerAddress( $checkout->cache['billing']['street'] . ', ' . $checkout->cache['billing']['city'] . ' ' . $checkout->cache['billing']['zone'] );
-			$eway->setCustomerPostcode( $checkout->cache['billing']['postal_code'] );
-
-			$eway->setCustomerInvoiceDescription( 'Purchase: ' . $purchase->get_id() );
-
-			$eway->setCardHoldersName( $checkout->cache['billing']['first_name'] . ' ' . $checkout->cache['billing']['last_name'] );
-			$eway->setCardNumber( $this->cc_cache['cc_number'] );
-			$eway->setCardExpiryMonth( $this->cc_cache['cc_expiration_month'] );
-			$eway->setCardExpiryYear( substr( $this->cc_cache['cc_expiration_year'], -2 ) );
-			$eway->setCVN( $this->cc_cache['cc_cvv'] );
-			$eway->setTotalAmount( self::convert_money_to_cents( sprintf( '%0.2f', $purchase->get_total( $this->get_payment_method() ) ) ) );
-
-			$eway->setTrxnNumber( $purchase->get_id() );
-
-			$eway->setOption1( sprintf( '%0.2f', $purchase->get_shipping_total( $this->get_payment_method() ) ) );
-			$eway->setOption2( sprintf( '%0.2f', $purchase->get_tax_total( $this->get_payment_method() ) ) );
-
-			return $eway;
-		}
-
-		private function convert_money_to_cents( $value ) {
-			// strip out commas
-			$value = preg_replace( "/\,/i", "", $value );
-			// strip out all but numbers, dash, and dot
-			$value = preg_replace( "/([^0-9\.\-])/i", "", $value );
-			// make sure we are dealing with a proper number now, no +.4393 or 3...304 or 76.5895,94
-			if ( !is_numeric( $value ) ) {
-				return 0.00;
-			}
-			// convert to a float explicitly
-			$value = (float)$value;
-			return round( $value, 2 )*100;
-		}
-
-		public function register_settings() {
-			$page = Group_Buying_Payment_Processors::get_settings_page();
-			$section = 'gb_authorizenet_settings';
-			add_settings_section( $section, self::__( 'eway' ), array( $this, 'display_settings_section' ), $page );
-			register_setting( $page, self::API_MODE_OPTION );
-			register_setting( $page, self::api_id_OPTION );
-			register_setting( $page, self::API_PASSWORD_OPTION );
-			add_settings_field( self::API_MODE_OPTION, self::__( 'Mode' ), array( $this, 'display_api_mode_field' ), $page, $section );
-			add_settings_field( self::api_id_OPTION, self::__( 'Customer ID' ), array( $this, 'display_api_id_field' ), $page, $section );
-			// add_settings_field(self::API_PASSWORD_OPTION, self::__('Transaction Key (Password)'), array($this, 'display_api_password_field'), $page, $section);
-			//add_settings_field(null, self::__('Currency'), array($this, 'display_currency_code_field'), $page, $section);
-		}
-
-		public function display_api_id_field() {
-			echo '<input type="text" name="'.self::api_id_OPTION.'" value="'.$this->api_id.'" size="80" />';
-			echo '<p class="description">Your unique eWAY customer ID assigned to you when you join eWAY. eg 11438715</p>';
-		}
-
-		public function display_api_password_field() {
-			echo '<input type="text" name="'.self::API_PASSWORD_OPTION.'" value="'.$this->api_password.'" size="80" />';
-		}
-
-		public function display_api_mode_field() {
-			echo '<label><input type="radio" name="'.self::API_MODE_OPTION.'" value="'.self::MODE_LIVE.'" '.checked( self::MODE_LIVE, $this->api_mode, FALSE ).'/> '.self::__( 'Live' ).'</label><br />';
-			echo '<label><input type="radio" name="'.self::API_MODE_OPTION.'" value="'.self::MODE_TEST.'" '.checked( self::MODE_TEST, $this->api_mode, FALSE ).'/> '.self::__( 'Sandbox' ).'</label>';
-		}
-
-		public function display_currency_code_field() {
-			echo 'Specified in your Authorize.Net Merchant Interface.';
-		}
-
-		public function display_exp_meta_box() {
-			return GB_PATH . '/controllers/payment_processors/meta-boxes/exp-only.php';
-		}
-
-		public function display_price_meta_box() {
-			return GB_PATH . '/controllers/payment_processors/meta-boxes/no-dyn-price.php';
-		}
-
-		public function display_limits_meta_box() {
-			return GB_PATH . '/controllers/payment_processors/meta-boxes/no-tipping.php';
+	public function credit_card_template_js() {
+		if ( self::has_payment_profile() ) {
+?>
+<script type="text/javascript" charset="utf-8">
+	jQuery(document).ready(function() {
+		jQuery(function() {
+			jQuery('.gb_credit_card_field_wrap').fadeOut();
+		    jQuery('[name="gb_credit_payment_method"]').live( 'click', function(){
+		    	var selected = jQuery(this).val();   // get value of checked radio button
+		    	if (selected == 'token') {
+		    		jQuery('.gb_credit_card_field_wrap').fadeOut();
+		    	} else {
+		    		jQuery('.gb_credit_card_field_wrap').fadeIn();
+		    	}
+		    });
+		});
+	});
+</script>
+			<?php
 		}
 	}
-	Group_Buying_eWay::register();
+
+	public function filter_payment_fields( $fields ) {
+		if ( self::has_profile_id() ) {
+			$customer_profile = self::get_customer_profile();
+			error_log( "customer profile payment fields: " . print_r( $customer_profile, true ) );
+			
+			$fields['payment_method'] = array(
+				'type' => 'radios',
+				'weight' => -10,
+				'label' => self::__( 'Payment Method' ),
+				'required' => TRUE,
+				'options' => array(
+					'token' => self::__( 'Credit Card: ' ) . $customer_profile->CCNumber,
+					'cc' => self::__( 'Use Different Credit Card' )
+				),
+				'default' => 'cim',
+			);
+		}
+		return $fields;
+	}
+
+	public function payment_review_fields( $fields, $processor, Group_Buying_Checkouts $checkout ) {
+		if ( isset( $_POST['gb_credit_payment_method'] ) && $_POST['gb_credit_payment_method'] == 'token' ) {
+			$fields['cim'] = array(
+				'label' => self::__( 'Primary Method' ),
+				'value' => self::__( 'Credit Card' ),
+				'weight' => 10,
+			);
+			unset( $fields['cc_name'] );
+			unset( $fields['cc_number'] );
+			unset( $fields['cc_expiration'] );
+			unset( $fields['cc_cvv'] );
+		}
+		return $fields;
+	}
+
+	/**
+	 * Validate the submitted credit card info
+	 * Store the submitted credit card info in memory for processing the payment later
+	 *
+	 * @param Group_Buying_Checkouts $checkout
+	 * @return void
+	 */
+	public function process_payment_page( Group_Buying_Checkouts $checkout ) {
+		// Don't try to validate a eWay payment
+		if ( !isset( $_POST['gb_credit_payment_method'] ) || ( isset( $_POST['gb_credit_payment_method'] ) && $_POST['gb_credit_payment_method'] != 'token' ) ) {
+			$fields = $this->payment_fields( $checkout );
+			foreach ( array_keys( $fields ) as $key ) {
+				if ( $key == 'cc_number' ) { // catch the cc_number so it can be sanatized
+					if ( isset( $_POST['gb_credit_cc_number'] ) && strlen( $_POST['gb_credit_cc_number'] ) > 0 ) {
+						$this->cc_cache['cc_number'] = preg_replace( '/\D+/', '', $_POST['gb_credit_cc_number'] );
+					}
+				}
+				elseif ( isset( $_POST['gb_credit_'.$key] ) && strlen( $_POST['gb_credit_'.$key] ) > 0 ) {
+					$this->cc_cache[$key] = $_POST['gb_credit_'.$key];
+				}
+			}
+			$this->validate_credit_card( $this->cc_cache, $checkout );
+		}
+	}
+
+	//////////////
+	// Settings //
+	//////////////
+
+	public function register_settings() {
+		$page = Group_Buying_Payment_Processors::get_settings_page();
+		$section = 'gb_authorizenet_settings';
+		add_settings_section( $section, self::__( 'eway' ), array( $this, 'display_settings_section' ), $page );
+		register_setting( $page, self::API_MODE_OPTION );
+		register_setting( $page, self::API_ID_OPTION );
+		register_setting( $page, self::API_USERNAME_OPTION );
+		register_setting( $page, self::API_PASSWORD_OPTION );
+		add_settings_field( self::API_MODE_OPTION, self::__( 'Mode' ), array( $this, 'display_api_mode_field' ), $page, $section );
+		add_settings_field( self::API_ID_OPTION, self::__( 'Customer ID' ), array( $this, 'display_api_id_field' ), $page, $section );
+		add_settings_field(self::API_USERNAME_OPTION, self::__('Username'), array($this, 'display_api_username_field'), $page, $section);
+		add_settings_field(self::API_PASSWORD_OPTION, self::__('Password'), array($this, 'display_api_password_field'), $page, $section);
+		//add_settings_field(null, self::__('Currency'), array($this, 'display_currency_code_field'), $page, $section);
+	}
+
+	public function display_api_id_field() {
+		echo '<input type="text" name="'.self::API_ID_OPTION.'" value="'.$this->api_id.'" size="80" />';
+		echo '<p class="description">Your unique 8 digit eWAY customer ID assigned to you when you join eWAY e.g. 1xxxxxxx.</p>';
+	}
+
+	public function display_api_username_field() {
+		echo '<input type="text" name="'.self::API_USERNAME_OPTION.'" value="'.$this->api_username.'" size="80" />';
+		echo '<p class="description">Your username which is used to login to eWAY Business Center.</p>';
+	}
+
+	public function display_api_password_field() {
+		echo '<input type="text" name="'.self::API_PASSWORD_OPTION.'" value="'.$this->api_password.'" size="80" />';
+		echo '<p class="description">Your password which is used to login to eWAY Business Center.</p>';
+	}
+
+	public function display_api_mode_field() {
+		echo '<label><input type="radio" name="'.self::API_MODE_OPTION.'" value="'.self::MODE_LIVE.'" '.checked( self::MODE_LIVE, $this->api_mode, FALSE ).'/> '.self::__( 'Live' ).'</label><br />';
+		echo '<label><input type="radio" name="'.self::API_MODE_OPTION.'" value="'.self::MODE_TEST.'" '.checked( self::MODE_TEST, $this->api_mode, FALSE ).'/> '.self::__( 'Test' ).'</label>';
+	}
+
+	public function display_currency_code_field() {
+		echo 'Specified in your Authorize.Net Merchant Interface.';
+	}
+
+	public function display_exp_meta_box() {
+		return GB_PATH . '/controllers/payment_processors/meta-boxes/exp-only.php';
+	}
+
+	public function display_price_meta_box() {
+		return GB_PATH . '/controllers/payment_processors/meta-boxes/no-dyn-price.php';
+	}
+
+	public function display_limits_meta_box() {
+		return GB_PATH . '/controllers/payment_processors/meta-boxes/no-tipping.php';
+	}
+}
+Group_Buying_eWay_Tokenized::register();
 
 
 	
