@@ -255,18 +255,26 @@ class Group_Buying_eWay_Tokenized extends Group_Buying_Credit_Card_Processors {
 		$user_id = $purchase->get_user();
 		$user = get_userdata( $user_id );
 		$profile_id = 0;
-		
+
 		// Create customer object
 		$customer = new stdClass;
-		$customer->customerRef = $account_id;
-		$customer->Title = "";
+		$customer->Title = "Mr.";
 		$customer->FirstName = $checkout->cache['billing']['first_name'];
 		$customer->LastName = $checkout->cache['billing']['last_name'];
-		$customer->Email = $user->user_email;
-		$customer->State = $checkout->cache['billing']['zone'];
 		$customer->Address =  $checkout->cache['billing']['street'];
+		$customer->Suburb = $checkout->cache['billing']['city'];
+		$customer->State = $checkout->cache['billing']['zone'];
+		$customer->Company = "";
 		$customer->PostCode = $checkout->cache['billing']['postal_code'];
-		$customer->Country = $checkout->cache['billing']['country'];
+		$customer->Country = strtolower( $checkout->cache['billing']['country'] );
+		$customer->Email = $user->user_email;
+		$customer->Fax = "";
+		$customer->Phone = "";
+		$customer->Mobile = "";
+		$customer->CustomerRef = $account_id;
+		$customer->JobDesc = "";
+		$customer->Comments = "";
+		$customer->URL = "";
 
 		// If a token payment don't try to update the CC
 		if ( isset( $this->cc_cache['cc_number'] ) ) {
@@ -327,15 +335,20 @@ class Group_Buying_eWay_Tokenized extends Group_Buying_Credit_Card_Processors {
 	public function create_payment( $profile_id, $total, $reference_id ) {
 		// SOAP Client
 		$client = $this->create_client();
-		
+
 		// Create payment object
 		$payment = new stdClass;
 		$payment->managedCustomerID = $profile_id;
-		$payment->amount = $total;
+		$payment->amount = self::convert_money_to_cents( $total );
 		$payment->invoiceReference = $reference_id;
 
-		$result = $client->ProcessPayment( $payment );
-		if( GBS_DEV ) error_log( "process payment: " . print_r( $result, true ) );
+		if( GBS_DEV ) error_log( 'payment: ' . print_r( $payment, TRUE ) );
+
+		try {
+			$result = $client->ProcessPayment( $payment );
+		} catch ( SoapFault $fault ) {
+			return FALSE;
+		}
 
 		if ( $result->ewayResponse->ewayTrxnStatus == "True" ) {
 			return $result->ewayResponse;
@@ -583,5 +596,3 @@ class Group_Buying_eWay_Tokenized extends Group_Buying_Credit_Card_Processors {
 	}
 }
 Group_Buying_eWay_Tokenized::register();
-
-
