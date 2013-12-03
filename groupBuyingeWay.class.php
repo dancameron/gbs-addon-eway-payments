@@ -271,7 +271,7 @@ class Group_Buying_eWay_Tokenized extends Group_Buying_Credit_Card_Processors {
 		// If a token payment don't try to update the CC
 		if ( isset( $this->cc_cache['cc_number'] ) ) {
 			$customer->CCNumber = $this->cc_cache['cc_number'];
-			$customer->CCNameOnCard = $this->cc_cache['cc_number'];
+			$customer->CCNameOnCard = $checkout->cache['billing']['first_name'] . ' ' . $checkout->cache['billing']['last_name'];
 			$customer->CCExpiryMonth = $this->cc_cache['cc_expiration_month'];
 			$customer->CCExpiryYear = substr( $this->cc_cache['cc_expiration_year'], -2 );
 			$customer->CVN = $this->cc_cache['cc_cvv'];
